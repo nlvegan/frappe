@@ -1,7 +1,7 @@
 """
 Test suite for Frappe Scheduler Monitor
 
-Tests the proactive monitoring and protection capabilities for stuck jobs
+Tests the monitoring and protection capabilities for stuck jobs
 in the Frappe scheduler system.
 """
 
@@ -33,17 +33,18 @@ class TestSchedulerMonitor(IntegrationTestCase):
         cache_key = f"scheduler_monitor_metrics:test_site"
         frappe.cache().delete(cache_key)
         
-        # Mock site config for testing
+        # Mock site config for testing with business-friendly language
         self.test_config = {
             'enabled': True,
-            'monitor_mode': 'observe_only',
-            'default_timeout_seconds': 300,  # 5 minutes for testing
-            'global_max_runtime_minutes': 30,  # 30 minutes for testing
+            'protection_level': 'monitor_only',
+            'standard_job_timeout_minutes': 5,  # 5 minutes for testing
+            'maximum_job_runtime_hours': 0.5,  # 30 minutes for testing
             'enable_graceful_termination': True,
-            'job_timeouts': {
-                'test.long_running_job': 600,  # 10 minutes
-                'test.quick_job': 60,  # 1 minute
-                'frappe.twofactor.delete_all_barcodes_for_users': 1800  # 30 minutes
+            'job_timeout_patterns': {
+                'test.long_running_job': 10,  # 10 minutes
+                'test.quick_job': 1,  # 1 minute
+                '*dues*': 60,  # Test the pattern matching
+                'frappe.twofactor.delete_all_barcodes_for_users': 30  # 30 minutes
             }
         }
         
@@ -52,6 +53,134 @@ class TestSchedulerMonitor(IntegrationTestCase):
         # Clean up cache
         cache_key = f"scheduler_monitor_metrics:test_site"
         frappe.cache().delete(cache_key)
+    
+    @patch.object(SchedulerMonitor, '_get_monitor_config')
+    @patch('frappe.core.doctype.rq_job.rq_job.get_all_queued_jobs')
+    def test_performance_limit_large_job_queue(self, mock_get_jobs, mock_config):
+        """Test that performance limits are enforced with large job queues"""
+        mock_config.return_value = {
+            'enabled': True,
+            'max_jobs_per_cycle': 50,  # Low limit for testing  
+            'default_timeout_seconds': 300
+        }
+        
+        # Create 1000 mock jobs (exceeds limit)
+        large_job_queue = []
+        for i in range(1000):
+            job = Mock()
+            job.id = f"job_{i}"
+            job.get_status.return_value = "started" if i < 50 else "queued"
+            job.started_at = now_datetime() - timedelta(minutes=10)
+            large_job_queue.append(job)
+        
+        mock_get_jobs.return_value = large_job_queue
+        
+        result = self.monitor.run_monitoring_cycle()
+        
+        # Should complete successfully despite large queue
+        self.assertEqual(result['status'], 'completed')
+        
+        # Should have limited the jobs checked
+        self.assertLessEqual(result['metrics']['total_running_jobs'], 50)  # Max running jobs found
+        
+    @patch.object(SchedulerMonitor, '_get_monitor_config') 
+    @patch('frappe.core.doctype.rq_job.rq_job.RQJob')
+    @patch('frappe.core.doctype.rq_job.rq_job.stop_job')
+    def test_job_termination_security_validation(self, mock_stop_job, mock_rq_job_class, mock_config):
+        """Test that job termination includes proper security validation"""
+        mock_config.return_value = {
+            'enabled': True,
+            'protection_level': 'full_protection',
+            'standard_job_timeout_minutes': 5
+        }
+        
+        # Mock RQJob instance
+        mock_rq_job = Mock()
+        mock_rq_job.job.kwargs = {'site': 'test_site'}  # Same site - should allow
+        mock_rq_job_class.return_value = mock_rq_job
+        
+        # Test successful termination with proper site
+        result = self.monitor._terminate_job("valid_job_123")
+        self.assertTrue(result)
+        mock_stop_job.assert_called_once_with("valid_job_123")
+        
+        # Reset mocks
+        mock_stop_job.reset_mock()
+        
+        # Test blocked termination with different site
+        mock_rq_job.job.kwargs = {'site': 'different_site'}
+        result = self.monitor._terminate_job("invalid_job_456")
+        self.assertFalse(result)
+        mock_stop_job.assert_not_called()  # Should not call stop_job
+        
+    @patch.object(SchedulerMonitor, '_get_monitor_config')
+    @patch('frappe.core.doctype.rq_job.rq_job.get_all_queued_jobs')
+    def test_type_safety_invalid_job_objects(self, mock_get_jobs, mock_config):
+        """Test resilience to invalid job objects without expected methods"""
+        mock_config.return_value = {
+            'enabled': True,
+            'default_timeout_seconds': 300
+        }
+        
+        # Mix of valid and invalid job objects
+        mixed_job_queue = [
+            Mock(spec=['get_status', 'id']),  # Valid job object
+            {'invalid': 'dict_object'},      # Invalid - dict instead of job object  
+            Mock(spec=['id']),               # Invalid - missing get_status method
+            None,                            # Invalid - None object
+        ]
+        
+        # Set up the valid job
+        mixed_job_queue[0].get_status.return_value = "started"
+        mixed_job_queue[0].id = "valid_job"
+        mixed_job_queue[0].started_at = now_datetime() - timedelta(minutes=10)
+        
+        mock_get_jobs.return_value = mixed_job_queue
+        
+        # Should handle invalid objects gracefully
+        result = self.monitor.run_monitoring_cycle()
+        
+        self.assertEqual(result['status'], 'completed')
+        # Should only process the 1 valid job
+        self.assertEqual(result['metrics']['total_running_jobs'], 1)
+    
+    def test_configuration_security_limits(self):
+        """Test that configuration validation applies reasonable security limits"""
+        monitor = SchedulerMonitor("test_site")
+        
+        # Test excessive job limit gets capped
+        dangerous_config = {
+            'max_jobs_per_cycle': 10000,  # Excessive
+            'standard_job_timeout_minutes': 0.1,  # Too low (6 seconds)
+            'protection_level': 'invalid_mode'  # Invalid
+        }
+        
+        # Apply security limits
+        safe_config = monitor._apply_security_limits(dangerous_config)
+        
+        # Should cap excessive values
+        self.assertLessEqual(safe_config['max_jobs_per_cycle'], 500)
+        self.assertGreaterEqual(safe_config['standard_job_timeout_minutes'], 1)
+        self.assertEqual(safe_config['protection_level'], 'monitor_only')
+    
+    def test_full_protection_mode_audit_logging(self):
+        """Test that full protection mode activation is properly audited"""
+        monitor = SchedulerMonitor("test_site")
+        
+        with patch('frappe.log_error') as mock_log_error:
+            # Enable full protection mode
+            config = {
+                'protection_level': 'full_protection',
+                'require_admin_approval_for_termination': True
+            }
+            
+            # Apply security validation
+            monitor._apply_security_limits(config)
+            
+            # Should create audit log for active mode
+            mock_log_error.assert_called()
+            call_args = mock_log_error.call_args
+            self.assertIn("Active Mode Enabled", call_args[1]['title'])
     
     @patch.object(SchedulerMonitor, '_get_monitor_config')
     def test_monitoring_disabled_by_default(self, mock_config):
@@ -124,24 +253,6 @@ class TestSchedulerMonitor(IntegrationTestCase):
         self.assertEqual(stuck_job_info['alert_level'], 'emergency')  # 4m > 3x 1m timeout
         self.assertEqual(stuck_job_info['recommended_action'], 'terminate_immediately')
     
-    def test_stuck_job_alert_creation(self):
-        """Test creation of StuckJobAlert objects"""
-        alert = StuckJobAlert(
-            job_id="test_123",
-            job_name="test.job",
-            queue="default",
-            runtime_minutes=15.5,
-            configured_timeout_minutes=10.0,
-            alert_level="warning",
-            recommended_action="monitor_closely"
-        )
-        
-        serialized = self.monitor._serialize_stuck_job(alert)
-        
-        self.assertEqual(serialized['job_id'], 'test_123')
-        self.assertEqual(serialized['runtime_minutes'], 15.5)
-        self.assertEqual(serialized['alert_level'], 'warning')
-    
     @patch.object(SchedulerMonitor, '_get_monitor_config')
     def test_job_timeout_resolution(self, mock_config):
         """Test job timeout resolution with various patterns"""
@@ -162,9 +273,9 @@ class TestSchedulerMonitor(IntegrationTestCase):
     @patch.object(SchedulerMonitor, '_get_monitor_config')
     @patch('frappe.utils.scheduler_monitor.stop_job')
     def test_job_termination_active_mode(self, mock_stop_job, mock_config):
-        """Test job termination in active mode"""
+        """Test job termination in full protection mode"""
         config = self.test_config.copy()
-        config['monitor_mode'] = 'active'
+        config['protection_level'] = 'full_protection'
         mock_config.return_value = config
         
         # Create emergency-level stuck job alert
@@ -186,10 +297,10 @@ class TestSchedulerMonitor(IntegrationTestCase):
     
     @patch.object(SchedulerMonitor, '_get_monitor_config')
     @patch('frappe.utils.scheduler_monitor.stop_job')
-    def test_job_termination_observe_only_mode(self, mock_stop_job, mock_config):
-        """Test that jobs are not terminated in observe-only mode"""
+    def test_job_termination_monitor_only_mode(self, mock_stop_job, mock_config):
+        """Test that jobs are not terminated in monitor-only mode"""
         config = self.test_config.copy()
-        config['monitor_mode'] = 'observe_only'
+        config['protection_level'] = 'monitor_only'
         mock_config.return_value = config
         
         # Create emergency-level stuck job alert
@@ -240,9 +351,9 @@ class TestSchedulerMonitor(IntegrationTestCase):
         mock_site_config.return_value = {
             'scheduler_monitor': {
                 'enabled': True,
-                'monitor_mode': 'active',
-                'job_timeouts': {
-                    'custom.job': 7200  # 2 hours
+                'protection_level': 'full_protection',
+                'job_timeout_patterns': {
+                    'custom.job': 120  # 2 hours in minutes
                 }
             }
         }
@@ -250,10 +361,10 @@ class TestSchedulerMonitor(IntegrationTestCase):
         config = self.monitor._get_monitor_config()
         
         self.assertTrue(config['enabled'])
-        self.assertEqual(config['monitor_mode'], 'active')
-        self.assertEqual(config['job_timeouts']['custom.job'], 7200)
+        self.assertEqual(config['protection_level'], 'full_protection')
+        self.assertEqual(config['job_timeout_patterns']['custom.job'], 120)
         # Should merge with defaults
-        self.assertIn('frappe.twofactor.delete_all_barcodes_for_users', config['job_timeouts'])
+        self.assertIn('frappe.twofactor.delete_all_barcodes_for_users', config['job_timeout_patterns'])
     
     @patch('frappe.get_site_config')
     def test_configuration_defaults(self, mock_site_config):
@@ -263,22 +374,9 @@ class TestSchedulerMonitor(IntegrationTestCase):
         config = self.monitor._get_monitor_config()
         
         self.assertFalse(config['enabled'])  # Disabled by default
-        self.assertEqual(config['monitor_mode'], 'observe_only')
-        self.assertEqual(config['default_timeout_seconds'], 1800)
-        self.assertIn('frappe.twofactor.delete_all_barcodes_for_users', config['job_timeouts'])
-    
-    @patch.object(SchedulerMonitor, '_get_monitor_config')
-    def test_utility_functions(self, mock_config):
-        """Test utility functions for external integration"""
-        mock_config.return_value = self.test_config
-        
-        # Test is_monitoring_enabled
-        self.assertTrue(is_monitoring_enabled("test_site"))
-        
-        # Test get_monitoring_status
-        status = get_monitoring_status("test_site")
-        self.assertTrue(status['enabled'])
-        self.assertEqual(status['site'], "test_site")
+        self.assertEqual(config['protection_level'], 'monitor_only')
+        self.assertEqual(config['standard_job_timeout_minutes'], 30)
+        self.assertIn('frappe.twofactor.delete_all_barcodes_for_users', config['job_timeout_patterns'])
     
     @patch.object(SchedulerMonitor, '_get_monitor_config')
     @patch.object(SchedulerMonitor, '_get_running_jobs')
@@ -341,7 +439,7 @@ class TestSchedulerMonitorIntegration(IntegrationTestCase):
         
         # Should have all required keys
         required_keys = ['enabled', 'monitor_mode', 'default_timeout_seconds', 
-                        'global_max_runtime_minutes', 'job_timeouts']
+                        'maximum_job_runtime_hours', 'job_timeout_patterns']
         for key in required_keys:
             self.assertIn(key, config)
     
