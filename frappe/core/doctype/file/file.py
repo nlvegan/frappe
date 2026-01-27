@@ -25,7 +25,9 @@ from frappe.utils import (
 	get_url,
 )
 from frappe.utils.file_manager import is_safe_path
+from frappe.utils.html_utils import escape_html
 from frappe.utils.image import optimize_image, strip_exif_data
+from frappe.utils.pdf import pdf_contains_js
 
 from .exceptions import (
 	AttachmentLimitReached,
@@ -36,7 +38,9 @@ from .exceptions import (
 from .utils import *
 
 exclude_from_linked_with = True
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # nosemgrep
+
 URL_PREFIXES = ("http://", "https://", "/api/method/")
 FILE_ENCODING_OPTIONS = ("utf-8-sig", "utf-8", "windows-1250", "windows-1252")
 
@@ -128,6 +132,7 @@ class File(Document):
 			return
 
 		self.validate_attachment_references()
+		self.enforce_public_file_restrictions()
 
 		# when dict is passed to get_doc for creation of new_doc, is_new returns None
 		# this case is handled inside handle_is_private_changed
@@ -137,7 +142,6 @@ class File(Document):
 		self.validate_file_path()
 		self.validate_file_url()
 		self.validate_file_on_disk()
-
 		self.file_size = frappe.form_dict.file_size or self.file_size
 
 	def validate_attachment_references(self):
@@ -152,6 +156,15 @@ class File(Document):
 
 		if self.attached_to_field and SPECIAL_CHAR_PATTERN.search(self.attached_to_field):
 			frappe.throw(_("The fieldname you've specified in Attached To Field is invalid"))
+
+	def enforce_public_file_restrictions(self):
+		if not self.is_private and frappe.get_system_settings(
+			"only_allow_system_managers_to_upload_public_files"
+		):
+			try:
+				frappe.only_for("System Manager")
+			except PermissionError:
+				frappe.throw(_("Only System Managers can make this file public."))
 
 	def after_rename(self, *args, **kwargs):
 		for successor in self.get_successors():
@@ -387,6 +400,10 @@ class File(Document):
 				_("File type of {0} is not allowed").format(self.file_type),
 				exc=FileTypeNotAllowed,
 			)
+
+	def check_content(self):
+		if self.file_type == "PDF" and self._content and pdf_contains_js(self._content):
+			frappe.throw(_("This PDF cannot be uploaded as it contains unsafe content."))
 
 	def validate_duplicate_entry(self):
 		if not self.flags.ignore_duplicate_entry_error and not self.is_folder:
@@ -649,7 +666,7 @@ class File(Document):
 
 		if isinstance(self._content, str):
 			self._content = self._content.encode()
-
+		self.check_content()
 		with open(file_path, "wb+") as f:
 			f.write(self._content)
 			os.fsync(f.fileno())
@@ -778,7 +795,7 @@ class File(Document):
 	def create_attachment_record(self):
 		icon = ' <i class="fa fa-lock text-warning"></i>' if self.is_private else ""
 		file_url = quote(frappe.safe_encode(self.file_url), safe="/:") if self.file_url else self.file_name
-		file_name = self.file_name or self.file_url
+		file_name = escape_html(self.file_name or self.file_url)
 
 		self.add_comment_in_reference_doc(
 			"Attachment",
@@ -875,7 +892,7 @@ def has_permission(doc, ptype=None, user=None, debug=False):
 
 		try:
 			ref_doc = frappe.get_doc(attached_to_doctype, attached_to_name)
-		except ModuleNotFoundError:
+		except (ModuleNotFoundError, ImportError):
 			return False
 		except frappe.DoesNotExistError:
 			frappe.clear_last_message()
